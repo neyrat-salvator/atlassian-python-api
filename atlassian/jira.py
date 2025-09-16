@@ -2057,6 +2057,16 @@ class Jira(AtlassianRestAPI):
         base_url = self.resource_url("issue")
         url = f"{base_url}/{issue_key}/transitions"
         return self.post(url, data={"transition": {"id": transition_id}})
+    
+    def set_issue_status_by_transition_name(self, issue_key: str, transition_name: str):
+        """
+        Setting status by transition_name
+        :param issue_key: str
+        :param transition_name: str
+        """
+        base_url = self.resource_url("issue")
+        url = f"{base_url}/{issue_key}/transitions"
+        return self.post(url, data={"transition": {"name": transition_name}})
 
     def get_issue_status(self, issue_key: str):
         base_url = self.resource_url("issue")
@@ -5791,19 +5801,4 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         :return:
         """
         response = self.get("rest/api/2/user/duplicated/count")
-        return response
-
-    def dark_feature_management(self, key: str, enable: bool = True) -> T_resp_json:
-        """
-        Dark Feature Management
-        https://confluence.atlassian.com/jirakb/dark-feature-management-1063554355.html
-        https://confluence.atlassian.com/jirakb/how-to-manage-dark-features-in-jira-server-and-data-center-959286331.html
-        i.e. sd.sla.improved.rendering.enabled
-        :return:
-        """
-        if enable:
-            data = {"enabled": "true"}
-        else:
-            data = {"enabled": "false"}
-        response = self.put(f"/rest/internal/1.0/darkFeatures/{key}", data=data)
         return response
