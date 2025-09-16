@@ -5,8 +5,7 @@ import logging
 import os
 import re
 import time
-import warnings
-from typing import cast
+from typing import cast, Literal
 
 import requests
 from bs4 import BeautifulSoup
@@ -14,15 +13,18 @@ from deprecated import deprecated
 from requests import HTTPError
 
 from atlassian import utils
-from atlassian.errors import (
+
+from .errors import (
     ApiConflictError,
     ApiError,
+    JsonRPCError,
     ApiNotAcceptable,
     ApiNotFoundError,
     ApiPermissionError,
     ApiValueError,
+    JsonRPCRestrictionsError
 )
-from atlassian.rest_client import AtlassianRestAPI
+from .rest_client import AtlassianRestAPI
 
 log = logging.getLogger(__name__)
 
@@ -847,7 +849,7 @@ class Confluence(AtlassianRestAPI):
         return _all_pages
 
     @deprecated(version="2.4.2", reason="Use get_all_restrictions_for_content()")
-    def get_all_restictions_for_content(self, content_id):
+    def get_all_restrictions_for_content_decorator(self, content_id):
         """Let's use the get_all_restrictions_for_content()"""
         return self.get_all_restrictions_for_content(content_id=content_id)
 
@@ -859,6 +861,125 @@ class Confluence(AtlassianRestAPI):
         """
         url = f"rest/api/content/{content_id}/restriction/byOperation"
         return self.get(url)
+    
+    def get_all_restrictions_from_page_json_rpc(self, page_id):
+        """
+        The JSON-RPC APIs for Confluence are provided here to help you browse and discover APIs you have access to.
+        JSON-RPC APIs operate differently than REST APIs.
+        To learn more about how to use these APIs,
+        please refer to the Confluence JSON-RPC documentation on Atlassian Developers.
+        """
+        if self.api_version == "cloud" or self.cloud:
+            return {}
+        url = "rpc/json-rpc/confluenceservice-v2"
+        data = {
+            "jsonrpc": "2.0",
+            "method": "getContentPermissionSets",
+            "id": 9,
+            "params": [page_id]
+        }
+        return self.post(url, data=data).get("result") or {}
+    
+    def update_restrictions_for_page_json_rpc(self, page_id, permission_type, content_permissions):
+        """
+        The JSON-RPC APIs for Confluence are provided here to help you browse and discover APIs you have access to.
+        JSON-RPC APIs operate differently than REST APIs.
+        To learn more about how to use these APIs,
+        please refer to the Confluence JSON-RPC documentation on Atlassian Developers.
+        """
+        if self.api_version == "cloud" or self.cloud:
+            return {}
+        url = "rpc/json-rpc/confluenceservice-v2"
+        data = {
+            "jsonrpc": "2.0",
+            "method": "setContentPermissions",
+            "id": 9,
+            "params": [page_id, permission_type, content_permissions]
+        }
+        return self.post(url, data=data).get("result") or {}
+    
+    def get_users_from_restricts_in_page_by_type(self, page_id: str, restriction_type: Literal['View', 'Edit']):
+        page_name = self.get_page_by_id(page_id=page_id)['title']
+        restrictions_in_page = self.get_all_restrictions_from_page_json_rpc(page_id=page_id)
+        try:
+            if len(restrictions_in_page) > 0:
+                for restriction_type_in_page in restrictions_in_page:
+                    if dict(restriction_type_in_page).get('type') == restriction_type:
+                        users = dict(restriction_type_in_page).get('contentPermissions')
+                return users
+            else:
+                raise JsonRPCRestrictionsError(f'On page "{page_name}" has no restrictions type of "{restriction_type}"')
+        except JsonRPCError:
+            raise
+
+    def create_restricts_from_from_user(self, user_name: str, restriction_type: Literal['View', 'Edit']):
+        content = {'type': restriction_type, 'userName': user_name, 'groupName': None}
+        
+        return content
+
+    def add_user_in_restricted_page(self, user_name: str, page_id: str, restriction_type: Literal['View', 'Edit']):
+        page_name = self.get_page_by_id(page_id=page_id).get('title')
+        user_find_view_bool = False
+        user_find_edit_bool = False
+        users_content_view: list = self.get_users_from_restricts_in_page_by_type(page_id=page_id, restriction_type='View')
+        users_content_edit: list = self.get_users_from_restricts_in_page_by_type(page_id=page_id, restriction_type='Edit')
+        current_user_content_view: dict = self.create_restricts_from_from_user(user_name=user_name, restriction_type='View')
+        current_user_content_edit: dict = self.create_restricts_from_from_user(user_name=user_name, restriction_type='Edit')
+        try:
+            if None not in [users_content_view, users_content_edit]:
+                if users_content_view is not None:
+                    for user in users_content_view:
+                        if dict(user).get('userName') == current_user_content_view.get('userName'):
+                            user_find_view_bool = True
+                if users_content_edit is not None:
+                    for user in users_content_edit:
+                        if dict(user).get('userName') == current_user_content_edit.get('userName'):
+                            user_find_edit_bool = True
+                if restriction_type == 'View':
+                    if user_find_view_bool == False:
+                        current_user_content = self.create_restricts_from_from_user(user_name=user_name, restriction_type=restriction_type)
+                        users_content_view.append(current_user_content)
+                        self.update_restrictions_for_page_json_rpc(page_id=page_id, user=user_name, permission_type=restriction_type, content_permissions=users_content_view)
+                    elif user_find_view_bool == True:
+                        raise JsonRPCRestrictionsError(f'User "{user_name}" already have restriction type of "{restriction_type}" on page "{page_name}"')
+                elif restriction_type == 'Edit':
+                    if user_find_edit_bool == False:
+                        current_user_content_view = self.create_restricts_from_from_user(user_name=user_name, restriction_type='View')
+                        current_user_content_edit = self.create_restricts_from_from_user(user_name=user_name, restriction_type=restriction_type)
+                        users_content_view.append(current_user_content_view)
+                        users_content_edit.append(current_user_content_edit)
+                        self.update_restrictions_for_page_json_rpc(page_id=page_id, permission_type='View', content_permissions=users_content_view)
+                        self.update_restrictions_for_page_json_rpc(page_id=page_id, permission_type=restriction_type, content_permissions=users_content_edit)
+                        print(f'User "{user_name}" granted restriction type of "{restriction_type}" on page "{page_name}"')
+                    elif user_find_edit_bool == True:
+                        raise JsonRPCRestrictionsError(f'User "{user_name}" already have restriction type of "{restriction_type}" on page "{page_name}"')
+        except JsonRPCError:
+            raise
+
+    def remove_user_from_restricted_page(self, user_name: str, page_id: str):
+        page_name = self.get_page_by_id(page_id=page_id).get('title')
+        user_find_bool = False
+        users_content_view: list = self.get_users_from_restricts_in_page_by_type(page_id=page_id, restriction_type='View')
+        users_content_edit: list = self.get_users_from_restricts_in_page_by_type(page_id=page_id, restriction_type='Edit')
+        current_user_content_view = self.create_restricts_from_from_user(user_name=user_name, restriction_type='View')
+        current_user_content_edit = self.create_restricts_from_from_user(user_name=user_name, restriction_type='Edit')
+        for user_index, user_value in enumerate(users_content_view):
+            if dict(user_value).get('userName') == current_user_content_view.get('userName'):
+                user_find_bool = True
+                users_content_view.pop(user_index)
+        for user_index, user_value in enumerate(users_content_edit):
+            if dict(user_value).get('userName') == current_user_content_edit.get('userName'):
+                user_find_bool = True
+                users_content_edit.pop(user_index)
+        try:
+            if user_find_bool == True:
+                self.update_restrictions_for_page_json_rpc(page_id=page_id, permission_type='View', content_permissions=users_content_view)
+                self.update_restrictions_for_page_json_rpc(page_id=page_id, permission_type='Edit', content_permissions=users_content_edit)
+                print(f'User "{user_name}" has been deleted from restrictions on page "{page_name}"')
+            elif user_find_bool == False:
+                raise JsonRPCRestrictionsError(f'User "{user_name}" has not founded in restrictions on page "{page_name}"')
+        except JsonRPCError:
+            raise
 
     def remove_page_from_trash(self, page_id):
         """
@@ -1361,8 +1482,9 @@ class Confluence(AtlassianRestAPI):
     def add_comment(self, page_id, text):
         """
         Add comment into page
-        :param page_id
-        :param text
+
+        :param page_id:
+        :param text:
         """
         data = {
             "type": "comment",
@@ -1396,6 +1518,7 @@ class Confluence(AtlassianRestAPI):
         """
         Attach (upload) a file to a page, if it exists it will update automatically the
         version the new file and keep the old one.
+
         :param title: The page name
         :type  title: ``str``
         :param space: The space name
@@ -1477,6 +1600,7 @@ class Confluence(AtlassianRestAPI):
         """
         Attach (upload) a file to a page, if it exists it will update automatically the
         version the new file and keep the old one.
+
         :param title: The page name
         :type  title: ``str``
         :param space: The space name
@@ -1570,15 +1694,6 @@ class Confluence(AtlassianRestAPI):
                     file_obj = io.BytesIO(response)
                     downloaded_files[file_name] = file_obj
                 else:
-                    # Sanitize filename if needed
-                    if re.search(r'[<>:"/\\|?*\x00-\x1F]', file_name):
-                        sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1F]', '_', file_name)
-                        warnings.warn(
-                            f"File name '{file_name}' contained invalid characters and was renamed to '{sanitized}'.",
-                            UserWarning
-                        )
-                        file_name = sanitized
-                    file_path = os.path.join(path, file_name)
                     # Save file to disk
                     file_path = os.path.join(path, file_name)
                     with open(file_path, "wb") as file:
@@ -1605,6 +1720,7 @@ class Confluence(AtlassianRestAPI):
     def delete_attachment(self, page_id, filename, version=None):
         """
         Remove completely a file if version is None or delete version
+
         :param version:
         :param page_id: file version
         :param filename:
@@ -1622,6 +1738,7 @@ class Confluence(AtlassianRestAPI):
     def delete_attachment_by_id(self, attachment_id, version):
         """
         Remove completely a file if version is None or delete version
+
         :param attachment_id:
         :param version: file version
         :return:
@@ -1631,6 +1748,30 @@ class Confluence(AtlassianRestAPI):
         else:
             url = f"rest/experimental/content/{attachment_id}/version/{version}"
         return self.delete(url)
+
+    def move_or_update_attachment_json_rpc(self, originalContentId: str, originalName: str, newContentEntityId: str=None, newName: str=None):
+        """
+        Move attachment from source confluence page to destination confluence page optionally with new title
+        \nOR
+        \nJust update attachment from source confluence page with new title
+        \nvia JSON-RPC.
+
+        :param str originalContentId: confluence source page id
+        :param str newContentEntityId: confluence destination page id
+        :param str originalName: source attachment title
+        :param str newName: new attachment title
+        """
+        if self.api_version == "cloud" or self.cloud:
+            return {}
+        url = "rpc/json-rpc/confluenceservice-v2"
+        data = {
+            "jsonrpc": "2.0",
+            "method": "moveAttachment",
+            "id": 9,
+            "params": [originalContentId, originalName, newContentEntityId, newName]
+        }
+
+        return self.post(url, data=data).get("result") or {}
 
     def remove_page_attachment_keep_version(self, page_id, filename, keep_last_versions):
         """
@@ -3638,6 +3779,7 @@ class Confluence(AtlassianRestAPI):
         :return:
         """
         url = f"rest/api/space/{space_key}/permissions/user/{user_key}"
+        # url = f"rest/api/space/{space_key}/permissions?userKey={user_key}"
         data = {"operations": operations or []}
         return self.put(url, data=data)
 
@@ -3697,6 +3839,24 @@ class Confluence(AtlassianRestAPI):
         }
 
         return self.post(url, data=data, headers=self.experimental_headers)
+    
+    def add_space_permission_json_rpc(self, space_key, user, permission):
+        """
+        The JSON-RPC APIs for Confluence are provided here to help you browse and discover APIs you have access to.
+        JSON-RPC APIs operate differently than REST APIs.
+        To learn more about how to use these APIs,
+        please refer to the Confluence JSON-RPC documentation on Atlassian Developers.
+        """
+        if self.api_version == "cloud" or self.cloud:
+            return {}
+        url = "rpc/json-rpc/confluenceservice-v2"
+        data = {
+            "jsonrpc": "2.0",
+            "method": "addPermissionToSpace",
+            "id": 9,
+            "params": [permission, user, space_key]
+        }
+        return self.post(url, data=data).get("result") or {}
 
     def remove_space_permission(self, space_key, user, permission):
         """
